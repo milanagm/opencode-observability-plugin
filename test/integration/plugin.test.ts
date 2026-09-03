@@ -151,6 +151,51 @@ let toolListShouldFail = false;
 
 const startedAt = 1_750_000_000_000;
 
+// The tool definitions the fake OpenCode client serves. They describe the
+// request being made, so only the newest user message carries them.
+const expectedToolDefinitions = [
+  {
+    name: "read",
+    description: "Read a file",
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string" } },
+      required: ["path"],
+    },
+  },
+  {
+    name: "webfetch",
+    description: "Fetch a URL",
+    parameters: {
+      type: "object",
+      properties: { url: { type: "string" } },
+      required: ["url"],
+    },
+  },
+];
+
+// Stands in for OpenCode's own message store, which session.messages() serves.
+// It outlives a plugin restart on purpose: reading the conversation from
+// OpenCode instead of accumulating it in the plugin is the point.
+type StoredMessage = {
+  info: { id: string; role: "user" | "assistant"; sessionID: string };
+  parts: unknown[];
+};
+const sessionStore = new Map<string, StoredMessage[]>();
+
+const storeMessage = (sessionID: string, message: StoredMessage) => {
+  const messages = sessionStore.get(sessionID) ?? [];
+  const existing = messages.findIndex((m) => m.info.id === message.info.id);
+
+  if (existing >= 0) {
+    messages[existing] = message;
+  } else {
+    messages.push(message);
+  }
+
+  sessionStore.set(sessionID, messages);
+};
+
 const getSpans = (request: CapturedRequest) =>
   request.body.resourceSpans.flatMap((resourceSpan) =>
     resourceSpan.scopeSpans.flatMap((scopeSpan) => scopeSpan.spans),
@@ -266,6 +311,19 @@ const sendUserMessage = async (input: {
       ],
     },
   );
+
+  storeMessage(input.sessionID, {
+    info: { id: input.messageID, role: "user", sessionID: input.sessionID },
+    parts: [
+      {
+        id: `${input.messageID}-part`,
+        sessionID: input.sessionID,
+        messageID: input.messageID,
+        type: "text",
+        text: input.text,
+      },
+    ],
+  });
 };
 
 const startGeneration = async (input: {
@@ -335,6 +393,26 @@ const completeGeneration = async (input: {
   completed: number;
   text?: string;
 }) => {
+  storeMessage(input.sessionID, {
+    info: {
+      id: input.assistantMessageID,
+      role: "assistant",
+      sessionID: input.sessionID,
+    },
+    parts:
+      input.text !== undefined && input.text !== ""
+        ? [
+            {
+              id: `${input.assistantMessageID}-part`,
+              sessionID: input.sessionID,
+              messageID: input.assistantMessageID,
+              type: "text",
+              text: input.text,
+            },
+          ]
+        : [],
+  });
+
   if (input.text !== undefined && input.text !== "") {
     await emitEvent({
       type: "message.part.updated",
@@ -381,6 +459,10 @@ const createHooks = async (baseUrl: string) => {
   const client = Schema.decodeUnknownSync(PluginClientSchema)({
     app: {
       log: () => Promise.resolve(),
+    },
+    session: {
+      messages: ({ path }: { path: { id: string } }) =>
+        Promise.resolve({ data: sessionStore.get(path.id) ?? [] }),
     },
     tool: {
       list: () => {
@@ -491,6 +573,7 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   requests.length = 0;
+  sessionStore.clear();
   collectorErrors.length = 0;
   collectorStatus = 200;
   hooksDisposed = false;
@@ -1386,6 +1469,10 @@ describe("built plugin", { concurrent: false }, () => {
       getJsonAttribute(generationSpans[1], "langfuse.observation.input"),
     ).toEqual([
       {
+        role: "user",
+        content: [{ type: "text", text: "Run three tool batches" }],
+      },
+      {
         role: "assistant",
         tool_calls: [
           {
@@ -1548,6 +1635,10 @@ describe("built plugin", { concurrent: false }, () => {
     expect(
       getJsonAttribute(secondGeneration, "langfuse.observation.input"),
     ).toEqual([
+      {
+        role: "user",
+        content: [{ type: "text", text: "Show recent commits" }],
+      },
       {
         role: "assistant",
         tool_calls: [
@@ -2327,6 +2418,131 @@ describe("built plugin", { concurrent: false }, () => {
       }
     }
   }, 15_000);
+
+  test("carries prior turns into later generation inputs", async () => {
+    const sessionID = "history-session";
+    const started = startedAt;
+
+    await sendUserMessage({
+      sessionID,
+      messageID: "history-user-1",
+      text: "Read the README",
+      started,
+    });
+    await startGeneration({
+      id: "history-step-1",
+      sessionID,
+      started: started + 100,
+    });
+    await completeGeneration({
+      sessionID,
+      userMessageID: "history-user-1",
+      assistantMessageID: "history-assistant-1",
+      started: started + 100,
+      completed: started + 500,
+      text: "The README describes the project",
+    });
+    await flushSession(sessionID);
+
+    await sendUserMessage({
+      sessionID,
+      messageID: "history-user-2",
+      text: "Now summarize it",
+      started: started + 1_000,
+    });
+    await startGeneration({
+      id: "history-step-2",
+      sessionID,
+      started: started + 1_100,
+    });
+    await completeGeneration({
+      sessionID,
+      userMessageID: "history-user-2",
+      assistantMessageID: "history-assistant-2",
+      started: started + 1_100,
+      completed: started + 1_500,
+      text: "A summary",
+    });
+
+    const { spans } = await flushSession(sessionID);
+    const generation = getSpan(spans, "opencode.generation");
+
+    expect(getJsonAttribute(generation, "langfuse.observation.input")).toEqual([
+      { role: "user", content: [{ type: "text", text: "Read the README" }] },
+      { role: "assistant", content: "The README describes the project" },
+      {
+        role: "user",
+        content: [{ type: "text", text: "Now summarize it" }],
+        tools: expectedToolDefinitions,
+      },
+    ]);
+  });
+
+  test("keeps the history complete when the plugin restarts mid-session", async () => {
+    // The conversation lives in OpenCode, not in the plugin, so a restart
+    // must not truncate what a generation input shows. A plugin that
+    // accumulated the history in memory would lose everything before it.
+    const sessionID = "restart-session";
+    const started = startedAt;
+
+    await sendUserMessage({
+      sessionID,
+      messageID: "restart-user-1",
+      text: "First question",
+      started,
+    });
+    await startGeneration({
+      id: "restart-step-1",
+      sessionID,
+      started: started + 100,
+    });
+    await completeGeneration({
+      sessionID,
+      userMessageID: "restart-user-1",
+      assistantMessageID: "restart-assistant-1",
+      started: started + 100,
+      completed: started + 800,
+      text: "First answer",
+    });
+    await flushSession(sessionID);
+
+    await disposeHooks();
+    hooksDisposed = false;
+    hooks = await createHooks(collectorBaseUrl);
+
+    await sendUserMessage({
+      sessionID,
+      messageID: "restart-user-2",
+      text: "Second question",
+      started: started + 5_000,
+    });
+    await startGeneration({
+      id: "restart-step-2",
+      sessionID,
+      started: started + 5_100,
+    });
+    await completeGeneration({
+      sessionID,
+      userMessageID: "restart-user-2",
+      assistantMessageID: "restart-assistant-2",
+      started: started + 5_100,
+      completed: started + 5_800,
+      text: "Second answer",
+    });
+
+    const { spans } = await flushSession(sessionID);
+    const generation = getSpan(spans, "opencode.generation");
+
+    expect(getJsonAttribute(generation, "langfuse.observation.input")).toEqual([
+      { role: "user", content: [{ type: "text", text: "First question" }] },
+      { role: "assistant", content: "First answer" },
+      {
+        role: "user",
+        content: [{ type: "text", text: "Second question" }],
+        tools: expectedToolDefinitions,
+      },
+    ]);
+  });
 
   test("can be disposed repeatedly", async () => {
     expect(hooks.dispose).toBeDefined();
