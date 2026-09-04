@@ -182,6 +182,7 @@ type StoredMessage = {
   parts: unknown[];
 };
 const sessionStore = new Map<string, StoredMessage[]>();
+let sessionMessagesShouldFail = false;
 
 const storeMessage = (sessionID: string, message: StoredMessage) => {
   const messages = sessionStore.get(sessionID) ?? [];
@@ -462,7 +463,9 @@ const createHooks = async (baseUrl: string) => {
     },
     session: {
       messages: ({ path }: { path: { id: string } }) =>
-        Promise.resolve({ data: sessionStore.get(path.id) ?? [] }),
+        sessionMessagesShouldFail
+          ? Promise.reject(new Error("session.messages unavailable"))
+          : Promise.resolve({ data: sessionStore.get(path.id) ?? [] }),
     },
     tool: {
       list: () => {
@@ -579,6 +582,7 @@ beforeEach(async () => {
   hooksDisposed = false;
   toolListCalls = 0;
   toolListShouldFail = false;
+  sessionMessagesShouldFail = false;
   hooks = await createHooks(collectorBaseUrl);
 });
 
@@ -2542,6 +2546,86 @@ describe("built plugin", { concurrent: false }, () => {
         tools: expectedToolDefinitions,
       },
     ]);
+  });
+
+  test("keeps the new user message when the history refresh fails", async () => {
+    // A snapshot from earlier in the same busy period does not contain a
+    // request that arrives afterwards. If the refresh that would pick it up
+    // fails, dropping the pending user message loses exactly the prompt this
+    // feature exists to show. No session.idle here on purpose: that would
+    // clear the cache and take the stale-snapshot path out of reach.
+    const sessionID = "stale-snapshot-session";
+    const started = startedAt;
+
+    await sendUserMessage({
+      sessionID,
+      messageID: "stale-user-1",
+      text: "Question 1",
+      started,
+    });
+    await startGeneration({
+      id: "stale-step-1",
+      sessionID,
+      started: started + 100,
+    });
+    await completeGeneration({
+      sessionID,
+      userMessageID: "stale-user-1",
+      assistantMessageID: "stale-assistant-1",
+      started: started + 100,
+      completed: started + 800,
+      text: "Answer 1",
+    });
+
+    // From here on OpenCode cannot be reached, so the snapshot stays behind.
+    sessionMessagesShouldFail = true;
+
+    await sendUserMessage({
+      sessionID,
+      messageID: "stale-user-2",
+      text: "Question 2",
+      started: started + 5_000,
+    });
+    await startGeneration({
+      id: "stale-step-2",
+      sessionID,
+      started: started + 5_100,
+    });
+    await completeGeneration({
+      sessionID,
+      userMessageID: "stale-user-2",
+      assistantMessageID: "stale-assistant-2",
+      started: started + 5_100,
+      completed: started + 5_800,
+      text: "Answer 2",
+    });
+
+    const { spans } = await flushSession(sessionID);
+    const generations = spans
+      .filter((span) => span.name === "opencode.generation")
+      .sort(
+        (a, b) => Number(a.startTimeUnixNano) - Number(b.startTimeUnixNano),
+      );
+    const input = getJsonAttribute(
+      generations[generations.length - 1],
+      "langfuse.observation.input",
+    );
+
+    const messages = Schema.decodeUnknownSync(Schema.Array(Schema.Unknown))(
+      input,
+    );
+
+    // The request that triggered the generation must be there, and last.
+    expect(messages[messages.length - 1]).toEqual({
+      role: "user",
+      content: [{ type: "text", text: "Question 2" }],
+      tools: expectedToolDefinitions,
+    });
+    // And the stale snapshot is still used for what it does hold.
+    expect(messages[0]).toEqual({
+      role: "user",
+      content: [{ type: "text", text: "Question 1" }],
+    });
   });
 
   test("can be disposed repeatedly", async () => {

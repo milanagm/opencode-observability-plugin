@@ -48,6 +48,7 @@ export class LangfuseClient {
     this.traceState.finalizedToolCallIds.clear();
     this.traceState.sessionParentIds.clear();
     this.traceState.sessionHistories.clear();
+    this.traceState.pendingUserMessageIdsBySession.clear();
   }
 
   clearSessionTraceState(sessionID: string) {
@@ -103,6 +104,7 @@ export class LangfuseClient {
     this.traceState.toolResultSourceMessageIdsBySession.delete(sessionID);
     this.traceState.latestTurnObservationsBySession.delete(sessionID);
     this.traceState.sessionHistories.delete(sessionID);
+    this.traceState.pendingUserMessageIdsBySession.delete(sessionID);
   }
 
   endActiveToolObservations(sessionID?: string, error?: SessionErrorInfo) {
@@ -506,6 +508,10 @@ export class LangfuseClient {
 
     if (input.messageID != null) {
       this.traceState.tracedMessageIds.add(input.messageID);
+      this.traceState.pendingUserMessageIdsBySession.set(
+        input.sessionID,
+        input.messageID,
+      );
     }
 
     const previousTurn = this.traceState.latestTurnObservationsBySession.get(
@@ -1200,6 +1206,20 @@ export class LangfuseClient {
       : history.messages.slice(0, startIndex);
   }
 
+  // True only when the snapshot provably holds that message. A failed refresh
+  // leaves the previous snapshot in place, and that one predates the request.
+  private snapshotHolds(sessionID: string, messageID: string | undefined) {
+    if (messageID == null) {
+      return false;
+    }
+
+    return (
+      this.traceState.sessionHistories
+        .get(sessionID)
+        ?.messageIds.has(messageID) === true
+    );
+  }
+
   private consumeGenerationInput(
     sessionID: string,
     assistantMessageID?: string,
@@ -1207,6 +1227,8 @@ export class LangfuseClient {
     const pending = this.traceState.generationInputsBySession.get(sessionID);
     const sourceMessageID =
       this.traceState.toolResultSourceMessageIdsBySession.get(sessionID);
+    const pendingUserMessageID =
+      this.traceState.pendingUserMessageIdsBySession.get(sessionID);
     this.traceState.generationInputsBySession.delete(sessionID);
     this.traceState.toolResultSourceMessageIdsBySession.delete(sessionID);
 
@@ -1223,12 +1245,32 @@ export class LangfuseClient {
         : [...assistantOfToolResults, ...(pending ?? [])];
     }
 
-    // The snapshot already carries the user message, only the tool definitions are new:
-    // they describe this request and are not part of the stored conversation.
+    // Taking the user message from both sources would list it twice, so it
+    // comes from the live buffer only when the snapshot does not hold it -
+    // after a failed refresh, or when the store had not caught up yet. The
+    // buffer's copy already carries this request's tool definitions.
+    const pendingUserMessages = this.snapshotHolds(
+      sessionID,
+      pendingUserMessageID,
+    )
+      ? []
+      : (pending ?? []).filter((message) => message.role === "user");
     const toolResults = (pending ?? []).filter(
       (message) => message.role === "tool",
     );
-    const combined = [...prefix, ...assistantOfToolResults, ...toolResults];
+    const combined = [
+      ...prefix,
+      ...assistantOfToolResults,
+      ...toolResults,
+      ...pendingUserMessages,
+    ];
+
+    if (pendingUserMessages.length > 0) {
+      return combined;
+    }
+
+    // Tool definitions describe this request, not the stored conversation, so
+    // they ride on its newest user message.
     const tools = pending?.find(
       (message): message is Extract<ChatMlMessage, { role: "user" }> =>
         message.role === "user" && "tools" in message,
@@ -1307,6 +1349,7 @@ export type LangfuseTraceState = {
   toolResultSourceMessageIdsBySession: Map<string, string>;
   sessionParentIds: Map<string, string>;
   sessionHistories: Map<string, SessionHistory>;
+  pendingUserMessageIdsBySession: Map<string, string>;
 };
 
 export type MessagePart = Extract<
@@ -1317,6 +1360,11 @@ export type MessagePart = Extract<
 export type SessionHistory = {
   messages: ChatMlMessage[];
   startIndexByAssistantMessageId: Map<string, number>;
+  // Which messages the snapshot actually holds. A stale snapshot - the last
+  // refresh failed, or it ran before the message existed - does not contain
+  // the request that triggered the generation, and the live buffer has to
+  // supply it.
+  messageIds: Set<string>;
 };
 
 function splitAssistantSteps(parts: MessagePart[]) {
@@ -1366,8 +1414,11 @@ export function buildSessionHistory(
 ): SessionHistory {
   const history: ChatMlMessage[] = [];
   const startIndexByAssistantMessageId = new Map<string, number>();
+  const messageIds = new Set<string>();
 
   for (const message of messages) {
+    messageIds.add(message.info.id);
+
     if (message.info.role === "user") {
       history.push(formatUserMessage(message.parts));
       continue;
@@ -1386,7 +1437,7 @@ export function buildSessionHistory(
     }
   }
 
-  return { messages: history, startIndexByAssistantMessageId };
+  return { messages: history, startIndexByAssistantMessageId, messageIds };
 }
 
 function withToolDefinitions(
@@ -1633,6 +1684,7 @@ export const createLangfuseClient = (input: {
       toolResultSourceMessageIdsBySession: new Map<string, string>(),
       sessionParentIds: new Map<string, string>(),
       sessionHistories: new Map<string, SessionHistory>(),
+      pendingUserMessageIdsBySession: new Map<string, string>(),
     };
 
     const processor = new LangfuseSpanProcessor({
