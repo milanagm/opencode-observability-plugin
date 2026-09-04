@@ -2628,6 +2628,107 @@ describe("built plugin", { concurrent: false }, () => {
     });
   });
 
+  test("keeps a failed tool result in the rebuilt history", async () => {
+    const sessionID = "failed-tool-session";
+    const started = startedAt;
+    const callID = "call-that-fails";
+
+    await sendUserMessage({
+      sessionID,
+      messageID: "failed-user-1",
+      text: "Read a file that is not there",
+      started,
+    });
+    await startGeneration({
+      id: "failed-step-1",
+      sessionID,
+      started: started + 100,
+    });
+    await completeGeneration({
+      sessionID,
+      userMessageID: "failed-user-1",
+      assistantMessageID: "failed-assistant-1",
+      started: started + 100,
+      completed: started + 800,
+      text: "That file is missing.",
+    });
+    await flushSession(sessionID);
+
+    storeMessage(sessionID, {
+      info: { id: "failed-assistant-1", role: "assistant", sessionID },
+      parts: [
+        {
+          id: "failed-tool-part",
+          sessionID,
+          messageID: "failed-assistant-1",
+          type: "tool",
+          callID,
+          tool: "read",
+          state: {
+            status: "error",
+            input: { path: "missing.txt" },
+            error: "ENOENT: no such file or directory",
+            time: { start: started + 200, end: started + 300 },
+          },
+        },
+        {
+          id: "failed-text-part",
+          sessionID,
+          messageID: "failed-assistant-1",
+          type: "text",
+          text: "That file is missing.",
+        },
+      ],
+    });
+
+    await sendUserMessage({
+      sessionID,
+      messageID: "failed-user-2",
+      text: "What happened?",
+      started: started + 5_000,
+    });
+    await startGeneration({
+      id: "failed-step-2",
+      sessionID,
+      started: started + 5_100,
+    });
+    await completeGeneration({
+      sessionID,
+      userMessageID: "failed-user-2",
+      assistantMessageID: "failed-assistant-2",
+      started: started + 5_100,
+      completed: started + 5_800,
+      text: "The read failed.",
+    });
+
+    const { spans } = await flushSession(sessionID);
+    const generation = getSpan(spans, "opencode.generation");
+    const input = getJsonAttribute(generation, "langfuse.observation.input");
+    const messages = Schema.decodeUnknownSync(Schema.Array(Schema.Unknown))(
+      input,
+    );
+
+    // The assistant's tool call must be followed by its result.
+    expect(messages).toHaveLength(4);
+    expect(messages[1]).toEqual({
+      role: "assistant",
+      content: "That file is missing.",
+      tool_calls: [
+        {
+          id: callID,
+          name: "read",
+          arguments: JSON.stringify({ path: "missing.txt" }),
+        },
+      ],
+    });
+    expect(messages[2]).toEqual({
+      role: "tool",
+      name: "read",
+      tool_call_id: callID,
+      content: "ENOENT: no such file or directory",
+    });
+  });
+
   test("can be disposed repeatedly", async () => {
     expect(hooks.dispose).toBeDefined();
     await hooks.dispose?.();

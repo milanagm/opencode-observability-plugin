@@ -1390,19 +1390,28 @@ function splitAssistantSteps(parts: MessagePart[]) {
   return steps;
 }
 
+function toolResultContent(
+  state: Extract<MessagePart, { type: "tool" }>["state"],
+) {
+  if ("output" in state) {
+    return state.output;
+  }
+
+  return "error" in state ? state.error : "";
+}
+
 function toolResultsOfStep(parts: MessagePart[]): ChatMlMessage[] {
   return parts
     .filter(
       (part): part is Extract<MessagePart, { type: "tool" }> =>
         part.type === "tool" &&
-        part.state.status === "completed" &&
-        "output" in part.state,
+        (part.state.status === "completed" || part.state.status === "error"),
     )
     .map((part) => ({
       role: "tool" as const,
       name: part.tool,
       tool_call_id: part.callID,
-      content: "output" in part.state ? part.state.output : "",
+      content: toolResultContent(part.state),
     }));
 }
 
